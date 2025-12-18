@@ -38,9 +38,10 @@ min_duration = 0.8  # 秒
 min_bytes = int(samplerate * min_duration * 2)  # 2バイト = int16
 
 # 誤作動防止のための設定
-MIN_TEXT_LENGTH = 2  # 最小テキスト長（文字数）
+MIN_TEXT_LENGTH = 5  # 最小テキスト長（文字数）- 意味のある発言のため引き上げ
 MAX_TEXT_LENGTH = 500  # 最大テキスト長（文字数）
 SILENCE_THRESHOLD = 0.3  # 無音検出の閾値（秒）
+SILENCE_GRACE_PERIOD = 1.5  # 無音検出の猶予期間（秒）- 発言途中の間を許容
 
 def init_params(file_path):
     load_dotenv(file_path)
@@ -48,6 +49,9 @@ def init_params(file_path):
         "control_port": int(os.getenv("CONTROL_PORT", 50000)),
         "mic_port": int(os.getenv("MIC_PORT", 50001)),
         "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "filter_model": os.getenv("FILTER_MODEL", "gpt-4o-mini"),
+        "filter_confidence_threshold": float(os.getenv("FILTER_CONFIDENCE_THRESHOLD", "0.6")),
+        "enable_llm_filter": os.getenv("ENABLE_LLM_FILTER", "true").lower() == "true",
     }
 
 def hankaku_to_zenkaku(text):
@@ -173,10 +177,152 @@ def transcribe_with_openai(audio_bytes, params, sr=16000):
         except Exception:
             pass
 
+def is_complete_sentence(text):
+    """
+    機械的に文が完結しているかをチェックする
+    句読点や終助詞の存在を確認
+    """
+    if not text:
+        return False
+    
+    # 句読点チェック
+    if text.endswith(("。", "！", "？", ".", "!", "?")):
+        return True
+    
+    # 終助詞チェック（よくある終助詞パターン）
+    ending_patterns = [
+        "です", "ます", "ました", "でした",
+        "ね", "よ", "な", "か", "わ",
+        "だね", "だよ", "だな", "だわ",
+        "ですね", "ですよ", "ますね", "ますよ",
+        "ません", "ませんでした",
+        "ください", "ましょう", "でしょう",
+    ]
+    
+    for pattern in ending_patterns:
+        if text.endswith(pattern):
+            return True
+    
+    return False
+
+def check_utterance_completeness_llm(text, params):
+    """
+    GPT-4o-miniを使って発言の完全性を判定する
+    
+    戻り値:
+        dict: {
+            "is_complete": bool,  # 完全な発言かどうか
+            "confidence": float,  # 確信度 (0.0-1.0)
+            "reason": str        # 判定理由
+        }
+    """
+    api_key = params.get("openai_api_key", "")
+    if not api_key:
+        print("WARNING: OPENAI_API_KEY が設定されていません。LLMフィルタをスキップします。")
+        return {"is_complete": True, "confidence": 0.0, "reason": "API key not set"}
+    
+    if not params.get("enable_llm_filter", True):
+        print("LLMフィルタが無効化されています。")
+        return {"is_complete": True, "confidence": 1.0, "reason": "LLM filter disabled"}
+    
+    client = OpenAI(api_key=api_key)
+    model = params.get("filter_model", "gpt-4o-mini")
+    
+    prompt = f"""以下の発言が完全な文か、途中で切れている不完全な文かを判定してください。
+
+判定基準:
+- 完全: 文として意味が完結している、主語・述語が揃っている、文末が適切
+- 不完全: 文が途中で終わっている、主語や述語が欠けている、フィラーのみ
+
+発言: "{text}"
+
+以下のJSON形式で回答してください:
+{{
+  "is_complete": true または false,
+  "confidence": 0.0から1.0の数値,
+  "reason": "判定理由を簡潔に"
+}}
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "あなたは日本語の文の完全性を判定する専門家です。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=100,
+            response_format={"type": "json_object"},
+        )
+        
+        result_text = response.choices[0].message.content
+        result = json.loads(result_text)
+        
+        print(f"[LLMフィルタ] 発言: '{text[:30]}...' -> 完全性: {result.get('is_complete')}, 確信度: {result.get('confidence'):.2f}")
+        return result
+        
+    except Exception as e:
+        print(f"LLMフィルタエラー: {e}")
+        traceback.print_exc()
+        # エラー時はフィルタリングしない（発言を通す）
+        return {"is_complete": True, "confidence": 0.0, "reason": f"Error: {str(e)}"}
+
+def should_filter_text(text, params):
+    """
+    テキストをフィルタリングすべきかを判定する
+    
+    段階的フィルタリング:
+    1. 機械的フィルタ（高速）
+    2. LLMフィルタ（精密）
+    
+    戻り値:
+        tuple: (should_filter: bool, reason: str)
+        - should_filter: Trueならフィルタリング（破棄）
+        - reason: フィルタリング理由
+    """
+    # ステージ1: 機械的フィルタ
+    if len(text) < MIN_TEXT_LENGTH:
+        return True, f"テキストが短すぎます（{len(text)}文字 < {MIN_TEXT_LENGTH}文字）"
+    
+    if len(text) > MAX_TEXT_LENGTH:
+        # 長すぎる場合は切り詰めるが、フィルタリングはしない
+        print(f"テキストが長すぎます（{len(text)}文字 > {MAX_TEXT_LENGTH}文字）。切り詰めます。")
+        return False, "OK (truncated)"
+    
+    # まず機械的に完全性をチェック
+    if is_complete_sentence(text):
+        print(f"[機械的フィルタ] 完全な文と判定: '{text[:30]}...'")
+        return False, "OK (mechanically complete)"
+    
+    # ステージ2: LLMフィルタ（機械的フィルタで不完全と判定された場合のみ）
+    if params.get("enable_llm_filter", True):
+        llm_result = check_utterance_completeness_llm(text, params)
+        is_complete = llm_result.get("is_complete", True)
+        confidence = llm_result.get("confidence", 0.0)
+        reason = llm_result.get("reason", "")
+        
+        threshold = params.get("filter_confidence_threshold", 0.6)
+        
+        # 確信度が閾値以上の場合のみLLMの判定を信頼
+        if confidence >= threshold:
+            if not is_complete:
+                return True, f"LLMフィルタ: 不完全な発言（確信度: {confidence:.2f}, 理由: {reason}）"
+            else:
+                return False, f"LLMフィルタ: 完全な発言（確信度: {confidence:.2f}）"
+        else:
+            # 確信度が低い場合は通す（偽陽性を避けるため）
+            print(f"[LLMフィルタ] 確信度が低いため通します（{confidence:.2f} < {threshold}）")
+            return False, f"OK (low confidence: {confidence:.2f})"
+    
+    # LLMフィルタが無効、または機械的フィルタで判定できなかった場合は通す
+    print(f"[フィルタ] 判定不能のため通します: '{text[:30]}...'")
+    return False, "OK (uncertain)"
+
 def send_audio(full_data, params):
     """
     音声データをOpenAI Whisperで文字起こししてcontrol.pyへ送信
-    誤作動防止のための検証も行う
+    段階的フィルタリング（機械的 → LLM）で不完全な発言を除外
     """
     global samplerate
 
@@ -196,12 +342,14 @@ def send_audio(full_data, params):
         print("文字起こし結果が空でした。スキップします。")
         return 0.0, "", duration
 
-    if len(text) < MIN_TEXT_LENGTH:
-        print(f"テキストが短すぎます（{len(text)}文字 < {MIN_TEXT_LENGTH}文字）。スキップします。")
+    # 段階的フィルタリング（機械的 + LLM）
+    should_filter, filter_reason = should_filter_text(text, params)
+    if should_filter:
+        print(f"フィルタリング: {filter_reason}")
         return 0.0, "", duration
-
+    
+    # 長すぎる場合は切り詰め
     if len(text) > MAX_TEXT_LENGTH:
-        print(f"テキストが長すぎます（{len(text)}文字 > {MAX_TEXT_LENGTH}文字）。切り詰めます。")
         text = text[:MAX_TEXT_LENGTH]
 
     s_text = sanitize_filename(text)
@@ -209,6 +357,7 @@ def send_audio(full_data, params):
     s_time = duration
 
     output(duration, s_time, s_text, full_data)
+    print(f"[フィルタ通過] '{text[:50]}...' (理由: {filter_reason})")
     return conf, s_text, duration
 
 def start_client(ip, port, message):

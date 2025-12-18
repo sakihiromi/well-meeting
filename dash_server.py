@@ -247,8 +247,6 @@ app.layout = html.Div([
                         {"label": "合意形成", "value": "合意形成"},
                         {"label": "定例会議", "value": "定例会議"},
                         {"label": "臨時会議", "value": "臨時会議"},
-                        {"label": "上長説明", "value": "上長説明"},
-                        {"label": "目標設定", "value": "目標設定"},
                     ],
                     value=[],
                     style={"marginBottom": "30px"},
