@@ -205,6 +205,12 @@ app.layout = html.Div([
             "borderRadius": "10px",
             "boxShadow": "0 4px 20px rgba(0,0,0,0.1)"
         }, children=[
+            # マスコットキャラクター
+            html.Div(style={"textAlign": "center", "marginBottom": "15px"}, children=[
+                html.Img(src="/assets/kuma_fairy.png", 
+                         style={"width": "100px", "height": "100px", "borderRadius": "50%",
+                                "boxShadow": "0 2px 10px rgba(0,0,0,0.1)"})
+            ]),
             html.H2("🎯 Meeting Keeper", style={"textAlign": "center", "marginBottom": "10px", "color": "#333"}),
             html.P("会議を開始する前に、以下の設定を行ってください。", 
                    style={"textAlign": "center", "marginBottom": "30px", "color": "#666"}),
@@ -284,7 +290,25 @@ app.layout = html.Div([
     
     # ダッシュボード（設定完了後に表示）
     html.Div(id="dashboard-page", children=[
-        html.H2("Meeting Keeper - Dashboard"),
+        # ヘッダーにマスコットとタイトル
+        html.Div(style={
+            "display": "flex", 
+            "alignItems": "center", 
+            "marginBottom": "20px",
+            "gap": "20px"
+        }, children=[
+            html.Img(
+                src="/assets/kuma_fairy.png", 
+                style={
+                    "width": "80px", 
+                    "height": "80px", 
+                    "borderRadius": "50%", 
+                    "boxShadow": "0 2px 8px rgba(0,0,0,0.1)",
+                    "flexShrink": "0"
+                }
+            ),
+            html.H2("Meeting Keeper - Dashboard", style={"margin": "0", "lineHeight": "1.2"}),
+        ]),
         html.Div(id="params-box", style={"marginBottom": "12px", "fontSize": "14px"}),
 
         # 現在の設定と設定変更ボタン
